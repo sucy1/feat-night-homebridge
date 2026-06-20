@@ -362,4 +362,130 @@ describe('pluginCLI', () => {
       }
     })
   })
+
+  // =========================================================================
+  // E2E scenarios: install / uninstall / list
+  // =========================================================================
+  describe('scenario: install → list shows the plugin → uninstall → list hides the plugin', () => {
+    beforeEach(() => {
+      vi.spyOn(PluginCLI, 'resolveNodeModulesRoot').mockImplementation((globalFlag = true) =>
+        globalFlag ? fakeNodeModules : fakeNodeModules,
+      )
+      vi.spyOn(PluginCLI, 'signalHomebridgeRestart').mockReturnValue(false)
+    })
+
+    function pluginDir(identifier: string): string {
+      return join(fakeNodeModules, identifier)
+    }
+
+    function identifiersInList(): string[] {
+      return PluginCLI.list({ global: false }).map(p => p.identifier)
+    }
+
+    it('scenario: install (npm actually lays down files) then appears in list and config', async () => {
+      // Simulate npm install: after "install" completes the package files
+      // exist inside fakeNodeModules. This is what `npm i` actually does
+      // when it isn't mocked, and lets us assert list observes the install.
+      vi.spyOn(PluginCLI, 'runNpmInstall').mockImplementation((spec) => {
+        // Strip any @version suffix so we seed the right directory.
+        const identifier = spec.startsWith('@')
+          ? spec.split('/').slice(0, 2).join('/').replace(/@[^@/]+$/, '')
+          : spec.replace(/@[^@/]+$/, '')
+        seedFakePlugin(identifier, '3.2.1')
+      })
+
+      expect(identifiersInList()).toEqual([])
+
+      await PluginCLI.install('homebridge-dummy', { noRestart: true, global: false })
+
+      // 1. Package directory was "installed" on disk.
+      expect(fs.existsSync(join(pluginDir('homebridge-dummy'), 'package.json'))).toBe(true)
+      // 2. list() picks up the new plugin.
+      expect(identifiersInList()).toContain('homebridge-dummy')
+      // 3. Config contains the default platform block.
+      const cfg = readConfig()
+      expect(cfg.platforms).toContainEqual(
+        expect.objectContaining({ platform: 'homebridge-dummy' }),
+      )
+
+      // Installing a second plugin keeps the first.
+      await PluginCLI.install('@acme/homebridge-dimmer', {
+        kind: 'accessory',
+        noRestart: true,
+        global: false,
+      })
+      expect(identifiersInList()).toEqual([
+        '@acme/homebridge-dimmer',
+        'homebridge-dummy',
+      ])
+      const cfg2 = readConfig()
+      expect(cfg2.accessories).toContainEqual(
+        expect.objectContaining({ accessory: '@acme/homebridge-dimmer' }),
+      )
+    })
+
+    it('scenario: uninstall (npm actually removes files) then disappears from list and config', async () => {
+      // Seed the plugin on disk AND in config, as if it had been installed
+      // previously. Then the uninstall test asserts both sides are cleaned up.
+      seedFakePlugin('homebridge-dummy', '3.2.1')
+      writeConfig({
+        platforms: [
+          { platform: 'homebridge-existing', name: 'Existing' },
+          { platform: 'homebridge-dummy', name: 'Dummy' },
+        ],
+        accessories: [
+          { accessory: 'homebridge-dummy.Light', name: 'Dummy Light' },
+        ],
+      })
+      expect(identifiersInList()).toContain('homebridge-dummy')
+      expect(fs.existsSync(pluginDir('homebridge-dummy'))).toBe(true)
+
+      vi.spyOn(PluginCLI, 'runNpmUninstall').mockImplementation((identifier) => {
+        // Simulate npm uninstall: remove the package directory.
+        const target = join(fakeNodeModules, identifier)
+        if (fs.existsSync(target)) {
+          fs.rmSync(target, { recursive: true, force: true })
+        }
+      })
+
+      await PluginCLI.uninstall('homebridge-dummy', { noRestart: true, global: false })
+
+      // 1. Package files were "uninstalled" from disk.
+      expect(fs.existsSync(pluginDir('homebridge-dummy'))).toBe(false)
+      // 2. list() no longer reports the plugin.
+      expect(identifiersInList()).not.toContain('homebridge-dummy')
+      // 3. Both platform and accessory config entries were pruned, unrelated
+      // entries (homebridge-existing) remain untouched.
+      const cfg = readConfig()
+      expect(cfg.platforms.map(p => p.platform)).toEqual(['homebridge-existing'])
+      expect(cfg.accessories.filter(a => String(a.accessory).startsWith('homebridge-dummy'))).toEqual([])
+    })
+
+    it('scenario: list reports correct versions and scopes for the installed set', async () => {
+      seedFakePlugin('homebridge-alpha', '1.0.0')
+      seedFakePlugin('@scope/homebridge-beta', '2.0.0')
+      // Noise: homebridge-looking package without the keyword must be excluded.
+      fs.mkdirpSync(join(fakeNodeModules, 'homebridge-orphan'))
+      writeFileSync(
+        join(fakeNodeModules, 'homebridge-orphan', 'package.json'),
+        JSON.stringify({ name: 'homebridge-orphan', version: '0.0.0' }),
+      )
+
+      const list = PluginCLI.list({ global: false })
+
+      expect(list).toHaveLength(2)
+      expect(list[0]).toMatchObject({
+        identifier: '@scope/homebridge-beta',
+        name: 'homebridge-beta',
+        scope: '@scope',
+        version: '2.0.0',
+      })
+      expect(list[1]).toMatchObject({
+        identifier: 'homebridge-alpha',
+        name: 'homebridge-alpha',
+        scope: undefined,
+        version: '1.0.0',
+      })
+    })
+  })
 })
